@@ -429,7 +429,7 @@ $wavPath  = $env:SOUNDTEST_WAV_PATH
 $textPath = $env:SOUNDTEST_TEXT_PATH
 if (-not $wavPath)  { throw "missing env SOUNDTEST_WAV_PATH" }
 if (-not $textPath) { throw "missing env SOUNDTEST_TEXT_PATH" }
-$text = Get-Content -LiteralPath $textPath -Raw
+$text = Get-Content -LiteralPath $textPath -Raw -Encoding UTF8
 $voice  = New-Object -ComObject SAPI.SpVoice
 $stream = New-Object -ComObject SAPI.SpFileStream
 $stream.Open($wavPath, 3, $true)
