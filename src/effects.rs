@@ -233,6 +233,9 @@ fn wsola_time_stretch(input: &[f32], stretch: f32, sample_rate: u32) -> Vec<f32>
 
     let mut frame_len = (sample_rate as f32 * 0.040).round() as usize;
     frame_len = frame_len.clamp(256, 4096);
+    if input.len() < frame_len {
+        return input.to_owned();
+    }
     let overlap = (frame_len / 2).clamp(64, frame_len - 1);
     let hop_out = frame_len - overlap;
     let hop_in = (hop_out as f32) / stretch;
@@ -574,5 +577,14 @@ mod tests {
         faster.speed = 1.2;
         let fast_out = apply_effects_mono(&samples, sample_rate, &faster);
         assert!(fast_out.len() < samples.len());
+    }
+
+    #[test]
+    fn wsola_does_not_panic_when_input_shorter_than_frame() {
+        // Regression test: 40ms frame at 22_050Hz is 882 samples, so 288 would panic before bounds checks.
+        let sample_rate = 22_050;
+        let input = vec![0.1f32; 288];
+        let out = wsola_time_stretch(&input, 1.25, sample_rate);
+        assert_eq!(out.len(), input.len());
     }
 }

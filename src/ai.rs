@@ -372,6 +372,7 @@ fn build_system_prompt(request: &RenderRequest<'_>) -> String {
     let available_list = available.join(", ");
     let requested = match request.requested_backend {
         BackendChoice::Auto => "auto".to_owned(),
+        BackendChoice::Onnx => "onnx".to_owned(),
         BackendChoice::System => "system".to_owned(),
         BackendChoice::Procedural => "procedural".to_owned(),
     };
@@ -390,11 +391,11 @@ fn build_system_prompt(request: &RenderRequest<'_>) -> String {
     prompt.push_str("- neutral, dragon, robot, fairy, giant, ghost, radio\n\n");
 
     prompt.push_str("Output format:\n");
-    prompt.push_str("backend: <system|procedural>\n");
-    prompt.push_str("text: <text to speak>                       (required for system)\n");
+    prompt.push_str("backend: <onnx|system|procedural>\n");
+    prompt.push_str("text: <text to speak>                       (required for onnx/system)\n");
     prompt.push_str("proc: <token text for procedural synthesis> (required for procedural)\n");
-    prompt.push_str("preset: <neutral|dragon|robot|fairy|giant|ghost|radio>   (only for system)\n");
-    prompt.push_str("amount: <0.0-1.0>                            (only for system)\n");
+    prompt.push_str("preset: <neutral|dragon|robot|fairy|giant|ghost|radio>   (only for onnx/system)\n");
+    prompt.push_str("amount: <0.0-1.0>                            (only for onnx/system)\n");
     prompt.push_str("speed: <0.4-1.8>                              (optional; 1.0 normal; <1 slower; >1 faster)\n");
     prompt.push_str(
         "pitch_semitones: <-24..24>                    (optional; negative lowers voice)\n",
@@ -409,9 +410,7 @@ fn build_system_prompt(request: &RenderRequest<'_>) -> String {
     prompt.push_str(
         "- If backend is procedural: output ONLY proc: lines. No text: or effect lines.\n",
     );
-    prompt.push_str(
-        "- If backend is system: output text: and effect lines. Do NOT output proc:.\n\n",
-    );
+    prompt.push_str("- If backend is onnx/system: output text: and effect lines. Do NOT output proc:.\n\n");
 
     prompt.push_str("Rules for text: lines:\n");
     prompt.push_str("- Keep the same meaning and language as the user's message.\n");
@@ -454,13 +453,14 @@ fn build_system_prompt(request: &RenderRequest<'_>) -> String {
     } else {
         prompt.push_str("Auto selection:\n");
         prompt.push_str("- Choose backend ONLY from the Available backends list above.\n");
-        prompt.push_str("- Prefer system for speaking voices when available.\n");
+        prompt.push_str("- Prefer onnx for speaking voices when available (fully offline and consistent).\n");
+        prompt.push_str("- Otherwise prefer system for speaking voices when available.\n");
         prompt.push_str(
-            "- For robots/devices: system with robot effects, or procedural if non-speaking.\n",
+            "- For robots/devices: onnx/system with robot effects, or procedural if non-speaking.\n",
         );
         prompt.push_str("- For static/nature objects (tree, mountain): prefer procedural.\n");
         prompt.push_str(
-            "- For animals: prefer system (with animal-like interjections) if available; else procedural.\n",
+            "- For animals: prefer onnx/system (with animal-like interjections) if available; else procedural.\n",
         );
     }
 
@@ -470,6 +470,7 @@ fn build_system_prompt(request: &RenderRequest<'_>) -> String {
 fn enforce_requested_backend(mut plan: RenderPlan, requested: BackendChoice) -> RenderPlan {
     let requested_backend = match requested {
         BackendChoice::Auto => return plan,
+        BackendChoice::Onnx => BackendKind::Onnx,
         BackendChoice::System => BackendKind::System,
         BackendChoice::Procedural => BackendKind::Procedural,
     };
@@ -488,7 +489,7 @@ fn enforce_requested_backend(mut plan: RenderPlan, requested: BackendChoice) -> 
                 plan.proc = Some("wind...".to_owned());
             }
         }
-        BackendKind::System => {
+        BackendKind::System | BackendKind::Onnx => {
             plan.proc = None;
         }
     }

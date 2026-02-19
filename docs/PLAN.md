@@ -14,6 +14,7 @@ This plan is written for iterating from an MVP to a higher-quality "object voice
   - supports `model` + `model_reasoning_effort` (default: `medium`)
   - `wire_api=auto` uses `/responses` then falls back to `/chat/completions`
 - Local backends:
+  - `onnx` (fully offline Chatterbox multilingual ONNX TTS)
   - `system` (system TTS rendered to WAV, then processed)
   - `procedural` (built-in token -> audio synthesis)
 - Render plan schema:
@@ -37,14 +38,14 @@ Effects quality:
 - Add optional "texture" effects: chorus, flanger, ring-mod, bitcrush, noise gate.
 
 User controls (without removing AI automation):
-- Add CLI overrides to bypass AI for effects:
+- Add CLI overrides to bypass AI for effects (implemented):
   - `--preset`, `--amount`, `--speed`, `--pitch-semitones`, `--bass-db`, `--treble-db`, `--reverb`, `--distortion`
-- Add `--no-ai` mode:
+- Add `--no-ai` mode (implemented):
   - user supplies backend + text/proc + effect knobs directly
   - useful for repeatable demos and offline runs
 
 Backend UX:
-- Add `soundtest doctor`:
+- Add `soundtest doctor` (implemented):
   - prints detected backends and resolved paths (`system_tts_binary`, procedural always)
   - prints platform notes (Windows uses PowerShell+SAPI; macOS uses `say`)
 

@@ -3,6 +3,7 @@ use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
+    Onnx,
     System,
     Procedural,
 }
@@ -162,14 +163,14 @@ impl RenderPlan {
 
         backend = match backend {
             BackendKind::Procedural if !has_proc && has_text => BackendKind::System,
-            BackendKind::System if !has_text && has_proc => BackendKind::Procedural,
+            BackendKind::System | BackendKind::Onnx if !has_text && has_proc => BackendKind::Procedural,
             other => other,
         };
 
         // Enforce the "exactly one backend output kind" rule.
         match backend {
             BackendKind::Procedural => text_field = None,
-            BackendKind::System => proc_field = None,
+            BackendKind::System | BackendKind::Onnx => proc_field = None,
         }
 
         Ok(Self {
@@ -200,7 +201,7 @@ impl RenderPlan {
                     out.push_str(&format!("proc: {}\n", proc));
                 }
             }
-            BackendKind::System => {
+            BackendKind::System | BackendKind::Onnx => {
                 if let Some(text) = &self.text {
                     out.push_str(&format!("text: {}\n", text));
                 }
@@ -232,6 +233,7 @@ impl RenderPlan {
 
 fn parse_backend(value: &str) -> Result<BackendKind> {
     match value.trim().to_ascii_lowercase().as_str() {
+        "onnx" | "chatterbox" | "chatterbox_onnx" | "local" => Ok(BackendKind::Onnx),
         "system" | "tts" => Ok(BackendKind::System),
         // Legacy/back-compat values.
         "piper" | "espeak" | "espeak-ng" | "espeakng" => Ok(BackendKind::System),
@@ -261,6 +263,14 @@ mod tests {
     fn parses_tts_text_plan() {
         let plan = RenderPlan::parse("backend: system\ntext: hello world").unwrap();
         assert_eq!(plan.backend, BackendKind::System);
+        assert_eq!(plan.text.as_deref(), Some("hello world"));
+        assert!(plan.proc.is_none());
+    }
+
+    #[test]
+    fn parses_onnx_text_plan() {
+        let plan = RenderPlan::parse("backend: onnx\ntext: hello world").unwrap();
+        assert_eq!(plan.backend, BackendKind::Onnx);
         assert_eq!(plan.text.as_deref(), Some("hello world"));
         assert!(plan.proc.is_none());
     }

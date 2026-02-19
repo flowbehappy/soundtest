@@ -19,6 +19,11 @@ pub struct Settings {
     pub model_reasoning_effort: String,
     pub wire_api: WireApi,
 
+    pub onnx_model_dir: Option<PathBuf>,
+    pub onnx_voice: Option<PathBuf>,
+    pub onnx_language_model: Option<PathBuf>,
+    pub onnx_runtime: Option<PathBuf>,
+
     pub system_tts_binary: String,
 }
 
@@ -29,6 +34,11 @@ struct SoundtestConfigFile {
     model: Option<String>,
     model_reasoning_effort: Option<String>,
     wire_api: Option<String>,
+
+    onnx_model_dir: Option<String>,
+    onnx_voice: Option<String>,
+    onnx_language_model: Option<String>,
+    onnx_runtime: Option<String>,
 
     system_tts_binary: Option<String>,
 }
@@ -55,6 +65,7 @@ pub fn load_settings(cli: &cli::Cli) -> Result<Settings> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_cfg = load_config_file(&config_path).with_context(|| {
         format!(
             "failed to read config file {}",
@@ -64,31 +75,45 @@ pub fn load_settings(cli: &cli::Cli) -> Result<Settings> {
 
     let codex = load_codex_defaults().unwrap_or_default();
 
-    let base_url = first_non_empty([
+    let require_ai = !cli.no_ai && !matches!(cli.command, Some(cli::Command::Doctor));
+
+    let base_url_opt = first_non_empty([
         cli.base_url.as_deref(),
         file_cfg.base_url.as_deref(),
         std::env::var("OPENAI_BASE_URL").ok().as_deref(),
         codex.base_url.as_deref(),
     ])
-    .map(str::to_owned)
-    .ok_or_else(|| missing_setting_error("base_url", &config_path))?;
+    .map(str::to_owned);
+    let base_url = if require_ai {
+        base_url_opt.ok_or_else(|| missing_setting_error("base_url", &config_path))?
+    } else {
+        base_url_opt.unwrap_or_else(|| "offline".to_owned())
+    };
 
-    let token = first_non_empty([
+    let token_opt = first_non_empty([
         cli.token.as_deref(),
         file_cfg.token.as_deref(),
         std::env::var("OPENAI_API_KEY").ok().as_deref(),
         codex.token.as_deref(),
     ])
-    .map(str::to_owned)
-    .ok_or_else(|| missing_setting_error("token", &config_path))?;
+    .map(str::to_owned);
+    let token = if require_ai {
+        token_opt.ok_or_else(|| missing_setting_error("token", &config_path))?
+    } else {
+        token_opt.unwrap_or_default()
+    };
 
-    let model = first_non_empty([
+    let model_opt = first_non_empty([
         cli.model.as_deref(),
         file_cfg.model.as_deref(),
         codex.model.as_deref(),
     ])
-    .map(str::to_owned)
-    .ok_or_else(|| missing_setting_error("model", &config_path))?;
+    .map(str::to_owned);
+    let model = if require_ai {
+        model_opt.ok_or_else(|| missing_setting_error("model", &config_path))?
+    } else {
+        model_opt.unwrap_or_else(|| "offline".to_owned())
+    };
 
     let model_reasoning_effort = first_non_empty([
         cli.reasoning_effort.as_deref(),
@@ -104,6 +129,45 @@ pub fn load_settings(cli: &cli::Cli) -> Result<Settings> {
         Some("auto"),
     ]));
 
+    let mut onnx_model_dir = if let Some(p) = cli.onnx_model_dir.clone() {
+        Some(resolve_path(p, &cwd))
+    } else if let Some(s) = file_cfg.onnx_model_dir.as_deref() {
+        Some(resolve_path(PathBuf::from(s), &config_dir))
+    } else {
+        None
+    };
+    if onnx_model_dir.is_none() {
+        let candidates = [
+            cwd.join("models").join("chatterbox-multilingual-onnx"),
+            cwd.join("models").join("chatterbox-multilingual-ONNX"),
+        ];
+        onnx_model_dir = candidates.into_iter().find(|p| p.is_dir());
+    }
+
+    let onnx_voice = if let Some(p) = cli.onnx_voice.clone() {
+        Some(resolve_path(p, &cwd))
+    } else if let Some(s) = file_cfg.onnx_voice.as_deref() {
+        Some(resolve_path(PathBuf::from(s), &config_dir))
+    } else {
+        None
+    };
+
+    let onnx_language_model = if let Some(p) = cli.onnx_language_model.clone() {
+        Some(resolve_path(p, &cwd))
+    } else if let Some(s) = file_cfg.onnx_language_model.as_deref() {
+        Some(resolve_path(PathBuf::from(s), &config_dir))
+    } else {
+        None
+    };
+
+    let onnx_runtime = if let Some(p) = cli.onnx_runtime.clone() {
+        Some(resolve_path(p, &cwd))
+    } else if let Some(s) = file_cfg.onnx_runtime.as_deref() {
+        Some(resolve_path(PathBuf::from(s), &config_dir))
+    } else {
+        None
+    };
+
     let system_tts_binary = first_non_empty([
         file_cfg.system_tts_binary.as_deref(),
         Some(default_system_tts_binary()),
@@ -117,6 +181,10 @@ pub fn load_settings(cli: &cli::Cli) -> Result<Settings> {
         model,
         model_reasoning_effort,
         wire_api,
+        onnx_model_dir,
+        onnx_voice,
+        onnx_language_model,
+        onnx_runtime,
         system_tts_binary,
     })
 }

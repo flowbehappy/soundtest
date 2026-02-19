@@ -1,8 +1,10 @@
 pub mod ai;
 pub mod backend;
 pub mod cli;
+pub mod chatterbox_onnx;
 pub mod config;
 pub mod effects;
+pub mod language;
 pub mod logging;
 pub mod procedural;
 pub mod render_plan;
@@ -29,13 +31,20 @@ pub async fn run(cli: cli::Cli) -> Result<()> {
     let log_path = logging::init()?;
     if cli.verbose {
         eprintln!("log: {}", log_path.to_string_lossy());
-        eprintln!(
-            "ai config: base_url={} model={} effort={} wire_api={:?}",
-            settings.base_url, settings.model, settings.model_reasoning_effort, settings.wire_api
-        );
+        if cli.no_ai {
+            eprintln!("ai config: disabled (--no-ai)");
+        } else {
+            eprintln!(
+                "ai config: base_url={} model={} effort={} wire_api={:?}",
+                settings.base_url, settings.model, settings.model_reasoning_effort, settings.wire_api
+            );
+        }
     }
 
     match (&cli.command, cli.speak.is_empty()) {
+        (Some(cli::Command::Doctor), true) => {
+            run_doctor(&cli, &settings, availability, run_start, log_path).await
+        }
         (Some(cli::Command::Speak(args)), true) => {
             run_single(&cli, &settings, availability, args, run_start, log_path).await
         }
@@ -47,6 +56,89 @@ pub async fn run(cli: cli::Cli) -> Result<()> {
             "no command provided. Use `soundtest speak <object> <text...>` or `soundtest --speak <object> <message>`"
         )),
     }
+}
+
+async fn run_doctor(
+    cli: &cli::Cli,
+    settings: &config::Settings,
+    availability: backend::BackendAvailability,
+    run_start: Instant,
+    log_path: std::path::PathBuf,
+) -> Result<()> {
+    let platform = format!(
+        "{}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+
+    println!("soundtest doctor");
+    println!("platform: {platform}");
+    if cli.verbose {
+        println!("log: {}", log_path.to_string_lossy());
+    }
+
+    println!("backends:");
+
+    match &availability.onnx_tts {
+        Some(onnx) => {
+            println!("  - onnx: ok");
+            println!("    model_dir: {}", onnx.config.model_dir.to_string_lossy());
+            println!("    voice: {}", onnx.voice_path.to_string_lossy());
+            println!("    runtime: {}", onnx.runtime_path.to_string_lossy());
+            println!(
+                "    language_model: {}",
+                onnx.language_model_path.to_string_lossy()
+            );
+        }
+        None => {
+            let configured = settings.onnx_model_dir.is_some();
+            if configured {
+                let reason = availability
+                    .onnx_tts_error
+                    .as_deref()
+                    .unwrap_or("unknown error");
+                println!("  - onnx: missing ({reason})");
+            } else {
+                println!("  - onnx: not configured (set onnx_model_dir / --onnx-model-dir)");
+            }
+        }
+    }
+
+    match &availability.system_tts {
+        Some(system) => {
+            println!("  - system: ok");
+            println!("    binary: {}", system.binary.to_string_lossy());
+        }
+        None => println!("  - system: missing"),
+    }
+
+    println!("  - procedural: ok");
+
+    if cli.verbose {
+        println!("ai:");
+        if cli.no_ai {
+            println!("  - disabled (--no-ai)");
+        } else {
+            println!("  - enabled");
+            println!("    base_url: {}", settings.base_url);
+            println!("    model: {}", settings.model);
+            println!("    reasoning_effort: {}", settings.model_reasoning_effort);
+            println!(
+                "    wire_api: {}",
+                format!("{:?}", settings.wire_api).to_ascii_lowercase()
+            );
+        }
+    }
+
+    logging::info(
+        "doctor.end",
+        json!({
+            "status": "ok",
+            "duration_ms": run_start.elapsed().as_millis(),
+        }),
+    );
+
+    Ok(())
 }
 
 async fn run_single(
@@ -71,6 +163,7 @@ async fn run_single(
         json!({
             "object": object,
             "requested_backend": format!("{:?}", cli.backend).to_ascii_lowercase(),
+            "no_ai": cli.no_ai,
             "message_chars": message.chars().count(),
             "base_url": &settings.base_url,
             "model": &settings.model,
@@ -85,29 +178,34 @@ async fn run_single(
         }),
     );
 
-    let request = ai::RenderRequest {
-        object,
-        message: &message,
-        requested_backend: cli.backend,
-        availability,
+    let mut render_plan = if cli.no_ai {
+        build_no_ai_render_plan(object, &message, cli.backend, &availability)
+    } else {
+        let request = ai::RenderRequest {
+            object,
+            message: &message,
+            requested_backend: cli.backend,
+            availability,
+        };
+
+        let client = ai::OpenAiClient::new(&settings.base_url, &settings.token)?;
+
+        let ai_result = client
+            .generate_render_plan(settings, &request)
+            .await
+            .context("failed to generate render plan")?;
+
+        if cli.verbose {
+            eprintln!(
+                "ai result: wire_api_used={} duration_ms={} output_chars={}",
+                ai_result.wire_api_used, ai_result.duration_ms, ai_result.output_chars
+            );
+        }
+
+        ai_result.plan
     };
-
-    let client = ai::OpenAiClient::new(&settings.base_url, &settings.token)?;
-
-    let ai_result = client
-        .generate_render_plan(settings, &request)
-        .await
-        .context("failed to generate render plan")?;
-
-    if cli.verbose {
-        eprintln!(
-            "ai result: wire_api_used={} duration_ms={} output_chars={}",
-            ai_result.wire_api_used, ai_result.duration_ms, ai_result.output_chars
-        );
-    }
-
-    let mut render_plan = ai_result.plan;
     normalize_render_plan(&mut render_plan, &message);
+    apply_effect_overrides(&mut render_plan, &EffectOverrides::from_cli(cli));
 
     if cli.verbose || cli.dry_run {
         eprintln!("--- render plan ---");
@@ -172,6 +270,44 @@ struct BatchSpeakItem {
     message: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct EffectOverrides {
+    preset: Option<String>,
+    amount: Option<f32>,
+    speed: Option<f32>,
+    pitch_semitones: Option<f32>,
+    bass_db: Option<f32>,
+    treble_db: Option<f32>,
+    reverb: Option<f32>,
+    distortion: Option<f32>,
+}
+
+impl EffectOverrides {
+    fn from_cli(cli: &cli::Cli) -> Self {
+        Self {
+            preset: cli.preset.clone(),
+            amount: cli.amount,
+            speed: cli.speed,
+            pitch_semitones: cli.pitch_semitones,
+            bass_db: cli.bass_db,
+            treble_db: cli.treble_db,
+            reverb: cli.reverb,
+            distortion: cli.distortion,
+        }
+    }
+
+    fn any_set(&self) -> bool {
+        self.preset.is_some()
+            || self.amount.is_some()
+            || self.speed.is_some()
+            || self.pitch_semitones.is_some()
+            || self.bass_db.is_some()
+            || self.treble_db.is_some()
+            || self.reverb.is_some()
+            || self.distortion.is_some()
+    }
+}
+
 #[derive(Debug)]
 struct BatchRenderedItem {
     index: usize,
@@ -216,6 +352,7 @@ async fn run_batch(
         json!({
             "batch_count": items.len(),
             "requested_backend": format!("{:?}", cli.backend).to_ascii_lowercase(),
+            "no_ai": cli.no_ai,
             "base_url": &settings.base_url,
             "model": &settings.model,
             "reasoning_effort": &settings.model_reasoning_effort,
@@ -232,8 +369,13 @@ async fn run_batch(
         }),
     );
 
-    let client = ai::OpenAiClient::new(&settings.base_url, &settings.token)?;
+    let client = if cli.no_ai {
+        None
+    } else {
+        Some(ai::OpenAiClient::new(&settings.base_url, &settings.token)?)
+    };
 
+    let effect_overrides = EffectOverrides::from_cli(cli);
     let ai_sem = Arc::new(Semaphore::new(cli.ai_concurrency));
     let tts_sem = Arc::new(Semaphore::new(cli.tts_concurrency));
     let dsp_sem = Arc::new(Semaphore::new(cli.dsp_concurrency));
@@ -248,29 +390,42 @@ async fn run_batch(
             let ai_sem = ai_sem.clone();
             let requested_backend = cli.backend;
             let verbose = cli.verbose;
+            let no_ai = cli.no_ai;
+            let effect_overrides = effect_overrides.clone();
 
             join_set.spawn(async move {
-                let ai_result = {
-                    let _permit = ai_sem
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| anyhow!("AI semaphore closed"))?;
-                    let request = ai::RenderRequest {
-                        object: &item.object,
-                        message: &item.message,
+                let mut plan = if no_ai {
+                    build_no_ai_render_plan(
+                        &item.object,
+                        &item.message,
                         requested_backend,
-                        availability: (*availability).clone(),
+                        &*availability,
+                    )
+                } else {
+                    let client = client.ok_or_else(|| anyhow!("internal error: missing AI client"))?;
+                    let ai_result = {
+                        let _permit = ai_sem
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| anyhow!("AI semaphore closed"))?;
+                        let request = ai::RenderRequest {
+                            object: &item.object,
+                            message: &item.message,
+                            requested_backend,
+                            availability: (*availability).clone(),
+                        };
+                        client
+                            .generate_render_plan(&settings, &request)
+                            .await
+                            .with_context(|| {
+                                format!("failed to generate render plan for `{}`", item.object)
+                            })?
                     };
-                    client
-                        .generate_render_plan(&settings, &request)
-                        .await
-                        .with_context(|| {
-                            format!("failed to generate render plan for `{}`", item.object)
-                        })?
-                };
 
-                let mut plan = ai_result.plan;
+                    ai_result.plan
+                };
                 normalize_render_plan(&mut plan, &item.message);
+                apply_effect_overrides(&mut plan, &effect_overrides);
 
                 let plan_debug = if verbose {
                     plan.to_debug_string()
@@ -286,7 +441,9 @@ async fn run_batch(
 
                 let output = match plan.backend {
                     render_plan::BackendKind::Procedural => plan.proc.clone().unwrap_or_default(),
-                    render_plan::BackendKind::System => plan.text.clone().unwrap_or_default(),
+                    render_plan::BackendKind::System | render_plan::BackendKind::Onnx => {
+                        plan.text.clone().unwrap_or_default()
+                    }
                 };
 
                 Ok(BatchPlannedItem {
@@ -353,27 +510,42 @@ async fn run_batch(
         let dsp_sem = dsp_sem.clone();
         let requested_backend = cli.backend;
         let verbose = cli.verbose;
+        let no_ai = cli.no_ai;
+        let effect_overrides = effect_overrides.clone();
 
         join_set.spawn(async move {
-            let ai_result = {
-                let _permit = ai_sem
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| anyhow!("AI semaphore closed"))?;
-                let request = ai::RenderRequest {
-                    object: &item.object,
-                    message: &item.message,
+            let mut plan = if no_ai {
+                build_no_ai_render_plan(
+                    &item.object,
+                    &item.message,
                     requested_backend,
-                    availability: (*availability).clone(),
+                    &*availability,
+                )
+            } else {
+                let client = client.ok_or_else(|| anyhow!("internal error: missing AI client"))?;
+                let ai_result = {
+                    let _permit = ai_sem
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| anyhow!("AI semaphore closed"))?;
+                    let request = ai::RenderRequest {
+                        object: &item.object,
+                        message: &item.message,
+                        requested_backend,
+                        availability: (*availability).clone(),
+                    };
+                    client
+                        .generate_render_plan(&settings, &request)
+                        .await
+                        .with_context(|| {
+                            format!("failed to generate render plan for `{}`", item.object)
+                        })?
                 };
-                client
-                    .generate_render_plan(&settings, &request)
-                    .await
-                    .with_context(|| format!("failed to generate render plan for `{}`", item.object))?
-            };
 
-            let mut plan = ai_result.plan;
+                ai_result.plan
+            };
             normalize_render_plan(&mut plan, &item.message);
+            apply_effect_overrides(&mut plan, &effect_overrides);
             let plan_debug = if verbose {
                 plan.to_debug_string()
             } else {
@@ -401,12 +573,13 @@ async fn run_batch(
                         sample_rate: procedural::SAMPLE_RATE,
                     }
                 }
-                render_plan::BackendKind::System => {
+                render_plan::BackendKind::System | render_plan::BackendKind::Onnx => {
                     let text = plan
                         .text
                         .as_deref()
                         .ok_or_else(|| anyhow!("render plan missing `text:` for TTS backend"))?
                         .to_owned();
+                    let plan_backend = plan.backend;
 
                     let tts_audio = {
                         let _permit = tts_sem
@@ -415,14 +588,15 @@ async fn run_batch(
                             .map_err(|_| anyhow!("TTS semaphore closed"))?;
                         let availability = (*availability).clone();
                         tokio::task::spawn_blocking(move || {
-                            backend::synthesize_system_tts_mono(
+                            backend::synthesize_tts_mono_for_plan(
                                 &availability,
                                 requested_backend,
+                                plan_backend,
                                 &text,
                             )
                         })
                         .await
-                        .map_err(|err| anyhow!("system TTS task failed: {err}"))??
+                        .map_err(|err| anyhow!("TTS task failed: {err}"))??
                     };
 
                     let effects_params = effects::EffectParams::from_spec(&plan.effects);
@@ -449,7 +623,9 @@ async fn run_batch(
 
             let output = match plan.backend {
                 render_plan::BackendKind::Procedural => plan.proc.clone().unwrap_or_default(),
-                render_plan::BackendKind::System => plan.text.clone().unwrap_or_default(),
+                render_plan::BackendKind::System | render_plan::BackendKind::Onnx => {
+                    plan.text.clone().unwrap_or_default()
+                }
             };
 
             Ok(BatchRenderedItem {
@@ -535,7 +711,7 @@ fn parse_batch_items(values: &[String]) -> Result<Vec<BatchSpeakItem>> {
 
 fn normalize_render_plan(plan: &mut render_plan::RenderPlan, fallback_message: &str) {
     match plan.backend {
-        render_plan::BackendKind::System => {
+        render_plan::BackendKind::System | render_plan::BackendKind::Onnx => {
             if plan
                 .text
                 .as_deref()
@@ -555,6 +731,92 @@ fn normalize_render_plan(plan: &mut render_plan::RenderPlan, fallback_message: &
                 plan.proc = Some("wind...".to_owned());
             }
         }
+    }
+}
+
+fn apply_effect_overrides(plan: &mut render_plan::RenderPlan, overrides: &EffectOverrides) {
+    if !overrides.any_set() {
+        return;
+    }
+    if plan.backend == render_plan::BackendKind::Procedural {
+        return;
+    }
+
+    if let Some(preset) = overrides.preset.as_deref() {
+        let preset = preset.trim();
+        if !preset.is_empty() {
+            plan.effects.preset = preset.to_owned();
+        }
+    }
+    if let Some(amount) = overrides.amount {
+        plan.effects.amount = amount;
+    }
+    if let Some(speed) = overrides.speed {
+        plan.effects.speed = Some(speed);
+    }
+    if let Some(pitch) = overrides.pitch_semitones {
+        plan.effects.pitch_semitones = Some(pitch);
+    }
+    if let Some(bass_db) = overrides.bass_db {
+        plan.effects.bass_db = Some(bass_db);
+    }
+    if let Some(treble_db) = overrides.treble_db {
+        plan.effects.treble_db = Some(treble_db);
+    }
+    if let Some(reverb) = overrides.reverb {
+        plan.effects.reverb = Some(reverb);
+    }
+    if let Some(distortion) = overrides.distortion {
+        plan.effects.distortion = Some(distortion);
+    }
+}
+
+fn build_no_ai_render_plan(
+    _object: &str,
+    message: &str,
+    requested_backend: cli::BackendChoice,
+    availability: &backend::BackendAvailability,
+) -> render_plan::RenderPlan {
+    let backend = match requested_backend {
+        cli::BackendChoice::Auto => {
+            if availability.onnx_tts.is_some() {
+                render_plan::BackendKind::Onnx
+            } else if availability.system_tts.is_some() {
+                render_plan::BackendKind::System
+            } else {
+                render_plan::BackendKind::Procedural
+            }
+        }
+        cli::BackendChoice::Onnx => render_plan::BackendKind::Onnx,
+        cli::BackendChoice::System => render_plan::BackendKind::System,
+        cli::BackendChoice::Procedural => render_plan::BackendKind::Procedural,
+    };
+
+    let message = message.trim();
+    let effects = effects::EffectSpec::default();
+
+    match backend {
+        render_plan::BackendKind::Procedural => render_plan::RenderPlan {
+            backend,
+            text: None,
+            proc: Some(message.to_owned()),
+            effects,
+            raw: format!("backend: procedural\nproc: {message}"),
+        },
+        render_plan::BackendKind::System => render_plan::RenderPlan {
+            backend,
+            text: Some(message.to_owned()),
+            proc: None,
+            effects,
+            raw: format!("backend: system\ntext: {message}"),
+        },
+        render_plan::BackendKind::Onnx => render_plan::RenderPlan {
+            backend,
+            text: Some(message.to_owned()),
+            proc: None,
+            effects,
+            raw: format!("backend: onnx\ntext: {message}"),
+        },
     }
 }
 
